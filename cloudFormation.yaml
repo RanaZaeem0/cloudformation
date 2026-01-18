@@ -55,3 +55,255 @@ Resources:
           AttributeDataType: String
           Required: true
           Mutable: false
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AppName}-Client'
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+
+  # AppSync GraphQL API
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${AppName}-API'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref UserPool
+        AwsRegion: !Ref AWS::Region
+        DefaultAction: ALLOW
+
+  # AppSync Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type S3UploadPayload {
+          uploadUrl: String!
+          key: String!
+        }
+
+        type Mutation {
+          getImageUploadUrl(fileName: String!, fileType: String!): S3UploadPayload!
+        }
+
+        type Query {
+          dummy: String
+        }
+
+        schema {
+          query: Query
+          mutation: Mutation
+        }
+
+  # Lambda Function for generating presigned URLs
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AppName}-PresignedUrlGenerator'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt PresignedUrlFunctionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+
+          def handler(event, context):
+              try:
+                  # Extract parameters
+                  file_name = event.get('fileName')
+                  file_type = event.get('fileType')
+                  user_id = event.get('userId')
+                  bucket_name = os.environ['BUCKET_NAME']
+                  
+                  # Validate inputs
+                  if not file_name or not file_type or not user_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'fileName, fileType, and userId are required'})
+                      }
+                  
+                  # Construct S3 key
+                  key = f"images/{user_id}/{file_name}"
+                  
+                  # Generate presigned URL (5 minutes expiration)
+                  presigned_url = s3_client.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': bucket_name,
+                          'Key': key,
+                          'ContentType': file_type
+                      },
+                      ExpiresIn=300  # 5 minutes
+                  )
+                  
+                  return {
+                      'uploadUrl': presigned_url,
+                      'key': key
+                  }
+                  
+              except ClientError as e:
+                  print(f"Error generating presigned URL: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Failed to generate presigned URL'})
+                  }
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # IAM Role for Lambda Function
+  PresignedUrlFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PresignedUrlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${ImageBucket.Arn}/images/*'
+
+  # Lambda Data Source for AppSyn c
+  LambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: LambdaDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncLambdaInvokeRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt PresignedUrlFunction.Arn
+
+  # IAM Role for AppSync to invoke Lambda
+  AppSyncLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-AppSyncLambdaInvokeRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt PresignedUrlFunction.Arn
+
+  # Updated AppSync Resolver using Lambda
+  GetImageUploadUrlLambdaResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: getImageUploadUrl
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+
+        export function request(ctx) {
+          const { fileName, fileType } = ctx.arguments;
+          const userId = ctx.identity.sub;
+          
+          // Validate inputs
+          if (!fileName || !fileType) {
+            util.error('fileName and fileType are required');
+          }
+          
+          return {
+            operation: 'Invoke',
+            payload: {
+              fileName: fileName,
+              fileType: fileType,
+              userId: userId
+            }
+          };
+        }
+
+        export function response(ctx) {
+          if (ctx.error) {
+            util.error(ctx.error.message, ctx.error.type);
+          }
+          return ctx.result;
+        }
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref ctxUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  GraphQLApiEndpoint:
+    Description: AppSync GraphQL API Endpoint
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiEndpoint'
+
+  GraphQLApiId:
+    Description: AppSync GraphQL API ID
+    Value: !GetAtt AppSyncApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiId'
+
+  ImageBucketName:
+    Description: S3 Bucket for Image Storage
+    Value: !Ref ImageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucketName'
+
+  Region:
+    Description: AWS Region
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
