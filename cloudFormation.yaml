@@ -1,0 +1,35 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AppSync API with S3 Image Upload - Presigned URL Generation'
+
+Parameters:
+  AppName:
+    Type: String
+    Default: ImageUploadApp
+    Description: Name prefix for all resources
+  
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: '*'
+    Description: Comma-separated list of allowed origins for CORS. Use '*' for development only.
+
+Resources:
+  # S3 Bucket for Image Storage
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-images-${AWS::AccountId}-${AWS::StackName}'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins: !Ref AllowedOrigins
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
